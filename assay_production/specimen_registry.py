@@ -49,7 +49,7 @@ class IsolationExecutor:
             return IsolationResult(specimen_id, -1, "", str(e), False, False, False, f"syntax: {e}")
         from .sandbox import run_in_sandbox
         res = run_in_sandbox("script", source_path, timeout=self.timeout_seconds)
-        problems = list(res.violations) + [f"stray file in temp directory: {n}" for n in res.stray_files]
+        problems = list(res.violations) + [f"unexpected change outside the scratch directory: {n}" for n in res.stray_files]
         if res.timed_out:
             return IsolationResult(specimen_id, -1, res.stdout, res.stderr, True, False, False, "timeout")
         if problems:

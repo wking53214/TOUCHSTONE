@@ -46,6 +46,34 @@ The numbers below are generated. If they ever disagree with what the verifier fi
 - The sandbox is a safety net for accidents and careless code, not a wall. See the top of `assay_production/sandbox.py` for exactly what it blocks and what it cannot.
 - If numpy or matplotlib is missing, the claims that need them are reported as skipped (and fail under `--strict`) instead of being counted as drift.
 
+**How the verifier runs specimens, and what it cannot stop**
+
+Every specimen that is run goes through `assay_production/sandbox.py`. In plain words:
+
+- *Its own folders.* Each run gets a fresh private folder. The specimen works inside `work/` (its working directory, `HOME`, and a private temp folder `work/tmp` that `TMPDIR` points at). The harness, the request and the result live in `ctl/`, where the specimen may not write. Everything is deleted afterwards: on success, on timeout, on an error, on Ctrl-C, on SIGTERM or SIGHUP, and at exit. A verifier killed with SIGKILL cannot tidy up, but its children die with it and the next run removes the abandoned folder.
+- *Stray writes are found by comparison, not by watching `/tmp`.* Before and after each run the verifier lists the specimen's own source folder, the sandbox's control folder and the top of the run folder, and reports anything new, removed or changed. Other programs creating files in `/tmp` (for example `warden-journal-*`) cannot affect the result. Residual limit: a hostile specimen that gets past the Python-level guard (for example through `ctypes`) and writes somewhere that is not one of those places, including the shared `/tmp`, is not seen.
+- *A result cannot be forged by writing a file.* The specimen runs in a child of a small trusted harness. The harness keeps a random nonce the specimen never receives, collects the observed facts (names defined, exception raised, exit code) over a pipe, and is the only writer of the result. A file the specimen writes (including `__assay_result__.json`) is never read, a result without the nonce is refused, and a report that disagrees with the real process exit code is refused. A specimen that exits early (`os._exit(0)`) is reported as "ended without a report". Residual limit: a hostile specimen that finds the report pipe by listing `/proc/self/fd` and writes a well-formed report into it can still forge the facts for its own run. Closing that needs the specimen to run in a different container, virtual machine or user than the supervisor. Likewise a plain `print` of "ALL CHECKS PASSED" followed by exit 0 is believed by claims that look for that text, because that is all a script-mode claim can observe.
+- *The caller's secrets stay out.* `verify_manifest.py` restarts itself once with a minimal environment (PATH, locale, HOME, TMPDIR, TERM, TZ and `ASSAY_*` only), marks itself non-dumpable and sets `no_new_privs`. The child gets a scrubbed environment, a new session, its own network and process-ID namespaces where `unshare` allows it (so the verifier's `/proc/<pid>` entries are invisible), and limits on CPU, memory, file size, open files and processes. The write guard also refuses reads of `/proc/<pid>/environ`, `mem`, `fd` and the usual credential files under the real home directory. Residual limits: the guard is a Python-level net that `ctypes` can bypass; reading other ordinary files on the machine is still possible; where the process-ID namespace is unavailable and the verifier runs as root, a specimen can still read other processes' memory. Run untrusted specimens in a disposable environment.
+- *Output is capped.* At most `ASSAY_OUTPUT_CAP` bytes (default 1 MiB) of stdout and of stderr are kept; a specimen that prints more is killed and the failure says so.
+- *Integrity.* The hash set covers every entry under `specimens/`, bytecode caches included. Symbolic links, special files and `.pyc` files fail the run (`specimens.layout`), and a specimen replaced by a link to identical content no longer matches its hash. Specimens are always compiled from their source text; an existing `.pyc` beside a specimen is never imported.
+
+*Time limits.* Each run gets `ASSAY_CLAIM_TIMEOUT` seconds (an exact value when set). If it is not set, the default is 120 seconds, stretched up to four times when the machine's load average is above its CPU count. All runs together get `ASSAY_TOTAL_TIMEOUT` seconds (default 300). A run that runs out of either is reported as `timeout` and says which limit was hit and what the machine load was, so a slow machine is not mistaken for a changed specimen.
+
+*Why a claim failed.* On failure the last line of stderr names the failing claims and the reason, for example `ASSAY: answer key NOT PROVEN (47/54 claims hold). claim fm3_4.critical_unreachable failed because timeout: timed out after 120s ...`. The printed report repeats it as a `Reason:` line under each failure. Reason codes: `timeout`, `stray_write`, `violation`, `output_overflow`, `child_died`, `forged_result`, `specimen_error`, `behaviour_changed`, `hash_mismatch`, `symlink`, `bytecode`, `unexpected_file`, `answer_key_drift`, `specimen_changed`, `claim_failed`.
+
+**The summary line** (for SWIZZLE, Warden and other relays). Every run prints one line starting with `ASSAY-SUMMARY: ` followed by compact JSON, as the last line of stdout, whether the key is proven or not. The human text above it is unchanged. Exit codes are unchanged (0 proven, 1 not).
+
+```text
+ASSAY-SUMMARY: {"schema":"assay-summary/1","all_claims_hold":true,"status":"ANSWER_KEY_UNVALIDATED",
+  "claims":{"total":54,"passed":54,"failed":0,"skipped":0},
+  "entries":{"total":25,
+             "counts":{"VERIFIED_BY_EXECUTION":11,"VERIFIED_BY_STATIC_CHECK":1,"UNVALIDATED":13},
+             "status":{"<entry id>":"VERIFIED_BY_EXECUTION", "...":"..."}},
+  "failures":[{"claim":"<claim id>","reason":"<reason code>","detail":"<text, at most 400 characters>"}]}
+```
+
+(The real line is a single line; it is wrapped here to read.) "N of 25 entries unvalidated" is `entries.counts.UNVALIDATED` of `entries.total`. `entries.status` gives the level of every entry. `all_claims_hold` says every claim that could be run held; it does not mean every entry is validated. When the key cannot be proven, `status` is `MANIFEST_INCONSISTENT` and `failures` lists each failing claim with its reason code.
+
 ## 5. Core Invariants & Guarantees
 
 Independently-known answers. Manifest verification. Specimens must not be "fixed" into green code without updating the known-answer file (that would poison SWIZZLE).

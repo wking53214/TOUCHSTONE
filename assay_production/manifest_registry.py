@@ -208,8 +208,43 @@ def check_table(specs: Optional[List[dict]] = None) -> None:
 
 # --- hashing ---------------------------------------------------------------
 
-def _ignored(parts: Tuple[str, ...]) -> bool:
+def is_bytecode(parts: Tuple[str, ...]) -> bool:
+    """True for a bytecode cache entry. They are hashed like any other file and are never expected."""
     return "__pycache__" in parts or parts[-1].endswith((".pyc", ".pyo"))
+
+
+def _entries(base: Path):
+    """Every entry under a directory as (relative parts, kind, path); links are never followed.
+
+    kind is "file", "link" (a symbolic link, to a file or a folder) or "special"
+    (a device, pipe or socket). Folders themselves are not listed.
+    """
+    import os
+    for cur, dirs, files in os.walk(base, followlinks=False):
+        for name in sorted(dirs):
+            full = os.path.join(cur, name)
+            if os.path.islink(full):
+                yield Path(full).relative_to(base).parts, "link", Path(full)
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(cur, d)))
+        for name in sorted(files):
+            full = Path(cur) / name
+            rel = full.relative_to(base).parts
+            if full.is_symlink():
+                yield rel, "link", full
+            elif full.is_file():
+                yield rel, "file", full
+            else:
+                yield rel, "special", full
+
+
+def _entry_hash(kind: str, path: Path) -> str:
+    """A file's SHA-256, or a marker no file can have for a link or special file."""
+    import os
+    if kind == "file":
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    if kind == "link":
+        return "symlink->" + os.readlink(path)
+    return "special-file"
 
 
 def hash_path(root: Path, rel: str) -> Optional[str]:
@@ -218,34 +253,67 @@ def hash_path(root: Path, rel: str) -> Optional[str]:
     Raw bytes on purpose: the flattened specimens are damaged precisely in
     their line endings and encodings, so any decoding would hide the damage.
     A directory hashes its files' relative paths and hashes in sorted order,
-    ignoring bytecode caches. Missing paths give None.
+    bytecode caches included (a planted .pyc changes the hash). A symbolic
+    link never hashes like the file it points at: it hashes as the text
+    "symlink->target", so a specimen replaced by a link to identical content
+    no longer matches. Missing paths give None.
     """
     target = Path(root) / rel
+    if target.is_symlink():
+        return _entry_hash("link", target)
     if target.is_file():
         return hashlib.sha256(target.read_bytes()).hexdigest()
     if target.is_dir():
         outer = hashlib.sha256()
-        for path in sorted(p for p in target.rglob("*") if p.is_file()):
-            sub = path.relative_to(target).parts
-            if _ignored(sub):
-                continue
+        for sub, kind, path in sorted(_entries(target), key=lambda e: e[0]):
             outer.update(("/".join(sub) + "\0").encode("utf-8"))
-            outer.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii") + b"\n")
+            outer.update(_entry_hash(kind, path).encode("utf-8", "surrogateescape") + b"\n")
         return outer.hexdigest()
     return None
 
 
 def corpus_files(root: Path) -> Dict[str, str]:
-    """Hash of every file under specimens/, registered or not (bytecode caches excluded)."""
+    """Hash of every entry under specimens/, registered or not.
+
+    Bytecode caches, symbolic links and special files are listed too (a link
+    as "symlink->target"), so each of them shows up as a change.
+    """
     base = Path(root) / "specimens"
     out: Dict[str, str] = {}
-    if base.is_dir():
-        for path in sorted(p for p in base.rglob("*") if p.is_file()):
-            rel = path.relative_to(Path(root))
-            if _ignored(rel.parts):
-                continue
-            out[rel.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return out
+    if base.is_symlink():
+        out["specimens"] = _entry_hash("link", base)
+    elif base.is_dir():
+        for sub, kind, path in _entries(base):
+            out[(Path("specimens") / Path(*sub)).as_posix()] = _entry_hash(kind, path)
+    return dict(sorted(out.items()))
+
+
+def corpus_layout_problems(root: Path, recorded: Optional[Dict[str, str]] = None) -> List[Tuple[str, str]]:
+    """What must never be under specimens/, as (reason code, plain text).
+
+    Symbolic links, special files and bytecode caches are always wrong. When
+    the recorded list of files is given, any file that is not on it is wrong too.
+    """
+    base = Path(root) / "specimens"
+    problems: List[Tuple[str, str]] = []
+    if base.is_symlink():
+        return [("symlink", "specimens/ is itself a symbolic link")]
+    if not base.is_dir():
+        return problems
+    for sub, kind, path in _entries(base):
+        name = (Path("specimens") / Path(*sub)).as_posix()
+        if kind == "link":
+            import os
+            problems.append(("symlink", f"{name} is a symbolic link to {os.readlink(path)} (a specimen must be "
+                                        "the file itself, even if the link points at identical content)"))
+        elif kind == "special":
+            problems.append(("unexpected_file", f"{name} is not a regular file"))
+        elif is_bytecode(sub):
+            problems.append(("bytecode", f"{name} is a compiled bytecode file; none belongs in the corpus and "
+                                          "the verifier never imports one"))
+        elif recorded is not None and name not in recorded:
+            problems.append(("unexpected_file", f"{name} is not in the recorded list of specimen files"))
+    return problems
 
 
 def block_digest(block_text: str) -> str:

@@ -180,7 +180,10 @@ def test_hash_path_covers_directory_trees(tmp_path):
     one = mr.hash_path(tmp_path, "d")
     (tmp_path / "d" / "__pycache__").mkdir()
     (tmp_path / "d" / "__pycache__" / "x.pyc").write_bytes(b"cache")
-    assert mr.hash_path(tmp_path, "d") == one          # caches are ignored
+    assert mr.hash_path(tmp_path, "d") != one          # caches are part of the hash now
+    (tmp_path / "d" / "__pycache__" / "x.pyc").unlink()
+    (tmp_path / "d" / "__pycache__").rmdir()
+    assert mr.hash_path(tmp_path, "d") == one
     (tmp_path / "d" / "sub" / "b.py").write_text("B")
     assert mr.hash_path(tmp_path, "d") != one           # content is not
     assert mr.hash_path(tmp_path, "missing") is None
@@ -354,3 +357,174 @@ def test_failure_messages_are_plain(corpus):
     out = failed(run_verify(corpus))
     for words in ("What happened:", "Verdicts that can no longer be trusted", "What to do:"):
         assert words in out
+
+
+# ------------------------------------------------- sandbox hardening round
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+from conftest import _env
+
+SUMMARY = re.compile(r"^ASSAY-SUMMARY: (\{.*\})$", re.M)
+
+
+def run_verify_env(corpus: Path, extra_env: dict, *args: str, timeout: int = 600) -> subprocess.CompletedProcess:
+    elsewhere = corpus.parent / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    env = _env()
+    env.update(extra_env)
+    return subprocess.run([sys.executable, str(corpus / "verify_manifest.py"), *args], cwd=elsewhere,
+                          capture_output=True, text=True, env=env, timeout=timeout)
+
+
+def test_summary_line_is_machine_readable_and_matches_the_human_text(corpus):
+    proc = run_verify(corpus)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    m = SUMMARY.search(proc.stdout)
+    assert m, proc.stdout[-800:]
+    data = json.loads(m.group(1))
+    assert data["schema"] == "assay-summary/1" and data["all_claims_hold"] is True and data["failures"] == []
+    counts = data["entries"]["counts"]
+    assert set(counts) == {"VERIFIED_BY_EXECUTION", "VERIFIED_BY_STATIC_CHECK", "UNVALIDATED"}
+    assert sum(counts.values()) == data["entries"]["total"] == len(data["entries"]["status"])
+    human = re.search(r"\((\d+) verified by execution, (\d+) by static check, (\d+) unvalidated, of (\d+) entries\)",
+                      proc.stdout)
+    assert human and [int(x) for x in human.groups()] == [counts["VERIFIED_BY_EXECUTION"],
+                                                         counts["VERIFIED_BY_STATIC_CHECK"],
+                                                         counts["UNVALIDATED"], data["entries"]["total"]]
+    assert data["claims"]["passed"] == data["claims"]["total"] and proc.stderr == ""
+
+
+def test_failure_says_which_claim_and_why_on_stderr_and_in_the_card(corpus):
+    target = corpus / "specimens" / "reference" / "citadel_v1.2.py"
+    target.write_bytes(target.read_bytes() + b"# edited\n")
+    proc = run_verify(corpus)
+    out = failed(proc)
+    last = proc.stderr.strip().splitlines()[-1]
+    assert "NOT PROVEN" in last and "hash.registered" in last and "hash_mismatch" in last
+    assert "citadel_v1.2.py" in last
+    assert "Reason: hash_mismatch" in proc.stdout
+    data = json.loads(SUMMARY.search(proc.stdout).group(1))
+    assert data["all_claims_hold"] is False
+    assert any(f["claim"] == "hash.registered" and f["reason"] == "hash_mismatch" for f in data["failures"])
+
+
+def test_a_slow_specimen_is_reported_as_timed_out_with_its_claim(corpus):
+    target = corpus / "specimens" / "reference" / "agent-factory-tactical-agents.py"
+    target.write_text(target.read_text() + "\nwhile True:\n    pass\n")
+    proc = run_verify_env(corpus, {"ASSAY_CLAIM_TIMEOUT": "3"})
+    failed(proc)
+    last = proc.stderr.strip().splitlines()[-1]
+    assert "NOT PROVEN" in last and "timeout" in last and "timed out after 3s" in " ".join(proc.stderr.split())
+    assert "ref.agent_factory.runs" in " ".join(proc.stderr.split())
+
+
+def test_overall_budget_is_configurable_and_reported(corpus):
+    proc = run_verify_env(corpus, {"ASSAY_TOTAL_TIMEOUT": "1"})
+    failed(proc)
+    assert "overall time budget" in proc.stdout and "timeout" in proc.stderr.strip().splitlines()[-1]
+
+
+def test_symlinked_specimen_with_identical_content_fails(corpus):
+    target = corpus / "specimens" / "reference" / "citadel_v1.2.py"
+    twin = corpus / "twin_of_citadel.py"
+    twin.write_bytes(target.read_bytes())
+    target.unlink()
+    target.symlink_to(twin)
+    assert target.read_bytes() == twin.read_bytes()
+    proc = run_verify(corpus)
+    out = failed(proc)
+    assert "symbolic link" in out and "citadel_v1.2.py" in out
+    assert "symlink" in proc.stderr.strip().splitlines()[-1] or "hash_mismatch" in proc.stderr
+
+
+def test_bytecode_under_specimens_fails(corpus):
+    cache = corpus / "specimens" / "pairs" / "__pycache__"
+    cache.mkdir()
+    (cache / "x.cpython-313.pyc").write_bytes(b"\0\0\0\0")
+    out = failed(run_verify(corpus))
+    assert "compiled bytecode" in out and "__pycache__" in out
+
+
+def test_folder_that_is_a_symlink_fails(corpus):
+    real = corpus / "specimens" / "pairs"
+    moved = corpus / "pairs_elsewhere"
+    real.rename(moved)
+    real.symlink_to(moved, target_is_directory=True)
+    assert "symbolic link" in failed(run_verify(corpus))
+
+
+def test_verifier_restarts_with_a_minimal_environment(corpus):
+    script = corpus / "verify_manifest.py"
+    edit(script, "from assay_production import verification  # noqa: E402",
+         "from assay_production import verification  # noqa: E402\n"
+         "import os\nopen(ROOT / 'envdump.txt', 'a').write(','.join(sorted(os.environ)) + '\\n')")
+    proc = run_verify_env(corpus, {"GITHUB_TOKEN": "ghp_secret", "AWS_SECRET_ACCESS_KEY": "s3", "ASSAY_STRICT": "1"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    first, second = (corpus / "envdump.txt").read_text().splitlines()
+    assert "GITHUB_TOKEN" in first and "GITHUB_TOKEN" not in second and "AWS_SECRET_ACCESS_KEY" not in second
+    assert "ASSAY_MINIMAL_ENV" in second and "ASSAY_STRICT" in second
+
+
+def test_sigterm_removes_scratch_directories_and_stops_the_child(corpus, tmp_path):
+    target = corpus / "specimens" / "reference" / "agent-factory-tactical-agents.py"
+    target.write_text(target.read_text() + "\nwhile True:\n    pass\n")
+    base = tmp_path / "tmpbase"
+    base.mkdir()
+    env = _env()
+    env.update({"TMPDIR": str(base), "ASSAY_CLAIM_TIMEOUT": "120"})
+    proc = subprocess.Popen([sys.executable, str(corpus / "verify_manifest.py")], cwd=corpus.parent, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.time() + 120
+        # wait until the endless specimen is running: the run directory holds a scratch folder and its harness
+        def running():
+            return any((d / "ctl" / "result.json").exists() is False and (d / "ctl" / "runner.py").exists()
+                       and "agent-factory" in (d / "ctl" / "request.json").read_text()
+                       for d in base.glob("assay-sandbox-*") if (d / "ctl" / "request.json").exists())
+        while time.time() < deadline and not running():
+            time.sleep(0.2)
+        assert running(), "the endless specimen never started"
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode != 0
+    time.sleep(0.5)
+    assert list(base.glob("assay-sandbox-*")) == []
+    ps = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+    assert str(base) not in ps, "a sandbox child is still running"
+
+
+def test_concurrent_temp_noise_cannot_fail_the_verifier(corpus, tmp_path):
+    base = tmp_path / "tmpbase"
+    base.mkdir()
+    stop = threading.Event()
+
+    def noise():
+        n = 0
+        while not stop.is_set():
+            n += 1
+            (base / f"warden-journal-{n}").write_text("x")
+            (base / f"warden-pyc-{n}").mkdir()
+            if n > 3:
+                (base / f"warden-journal-{n - 3}").unlink(missing_ok=True)
+                try:
+                    (base / f"warden-pyc-{n - 3}").rmdir()
+                except OSError:
+                    pass
+
+    t = threading.Thread(target=noise, daemon=True)
+    t.start()
+    try:
+        proc = run_verify_env(corpus, {"TMPDIR": str(base)})
+    finally:
+        stop.set()
+        t.join()
+    assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -30,14 +30,17 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import manifest_registry as mr
 from .manifest_status import ManifestVerifier
+from . import sandbox as sandbox_module
 from .sandbox import SandboxResult, describe_isolation, run_in_sandbox
 
 EXECUTION = "VERIFIED_BY_EXECUTION"
@@ -85,6 +88,7 @@ class Claim:
     next_step: str = ""
     unprovable: Tuple[str, ...] = ()  # entries named in the failure message (default: entries)
     consequence: str = ""             # replaces the "verdicts that can no longer be trusted" line
+    reason: str = ""                  # short machine-readable cause: timeout, stray_write, hash_mismatch, ...
 
 
 @dataclass
@@ -240,6 +244,22 @@ def entries_for_path(rel: str) -> List[str]:
 
 # ------------------------------------------------------------------ the run
 
+_REASON_BY_PREFIX = (("hash.", "hash_mismatch"), ("specimens.layout", "unexpected_file"),
+                     ("sandbox.guard", "stray_write"), ("sandbox.corpus_untouched", "stray_write"),
+                     ("manifest.", "answer_key_drift"), ("registry.", "answer_key_drift"),
+                     ("readme.", "answer_key_drift"), ("table.", "answer_key_drift"))
+
+
+def default_reason(cid: str, kind: str) -> str:
+    """A short cause for a failed claim that did not name its own (see Claim.reason)."""
+    for prefix, reason in _REASON_BY_PREFIX:
+        if cid.startswith(prefix):
+            return reason
+    if cid.startswith(("pair.", "uztc.", "fm3_", "fm_", "ref.")) and kind != "execution":
+        return "specimen_changed"
+    return "claim_failed"
+
+
 class Verifier:
     def __init__(self, root: Path, *, strict: bool = False):
         self.root = Path(root)
@@ -247,38 +267,25 @@ class Verifier:
         self.strict = strict
         self.report = Report()
         self.sandbox_runs: List[Tuple[str, SandboxResult, Tuple[str, ...]]] = []
+        self.deadline = time.monotonic() + sandbox_module.total_budget()
 
     # -- recording ----------------------------------------------------------
     def check(self, cid: str, label: str, ok: bool, *, kind: str = "static", entries: Sequence[str] = (),
               regen: bool = False, problem: str = "", next_step: str = "", unprovable: Sequence[str] = (),
-              skipped: bool = False, consequence: str = "") -> bool:
+              skipped: bool = False, consequence: str = "", reason: str = "") -> bool:
         self.report.claims.append(Claim(cid, label, bool(ok), kind, tuple(entries), skipped, regen, problem,
                                         next_step or NEXT_DRIFT, tuple(unprovable) or tuple(entries),
-                                        consequence))
+                                        consequence, "" if ok else (reason or default_reason(cid, kind))))
         return bool(ok)
 
     # -- sandbox ------------------------------------------------------------
     def run(self, name: str, mode: str, target: Path, entries: Sequence[str] = (), **kw) -> SandboxResult:
-        res = run_in_sandbox(mode, target, **kw)
+        res = run_in_sandbox(mode, target, deadline=self.deadline, **kw)
         self.sandbox_runs.append((name, res, tuple(entries)))
         return res
 
     def sandbox_problem(self, res: SandboxResult) -> str:
-        parts = []
-        if res.violations:
-            parts.append("the specimen was stopped trying to: " + "; ".join(res.violations))
-        if res.stray_files:
-            parts.append("new item(s) appeared in the system temp directory during the run: "
-                         + ", ".join(res.stray_files) + " (if another program on this machine made them, "
-                         "run the check again)")
-        if res.timed_out:
-            parts.append(res.detail)
-        elif not res.completed:
-            parts.append(res.detail or "the sandbox child did not report")
-        err = res.error
-        if err:
-            parts.append(f"it raised {err.get('type')}: {err.get('message')}")
-        return "; ".join(parts)
+        return "; ".join(f"[{code}] {text}" for code, text in res.problems())
 
     def exec_claim(self, cid: str, label: str, entries: Sequence[str], res: SandboxResult,
                    condition: Callable[[SandboxResult], bool], *, expect_error: bool = False) -> bool:
@@ -291,12 +298,14 @@ class Verifier:
         clean = res.clean and res.completed and not res.timed_out
         ok = clean and (expect_error or not res.error) and condition(res)
         problem = "" if ok else (self.sandbox_problem(res) or "the run did not show the behaviour the claim requires")
-        return self.check(cid, label, ok, kind="execution", entries=entries, problem=problem)
+        reason = res.reason_code or "behaviour_changed"
+        return self.check(cid, label, ok, kind="execution", entries=entries, problem=problem, reason=reason)
 
     # ---------------------------------------------------------------- phases
     def all(self) -> Report:
         before = mr.corpus_files(self.root)
         self.table_phase()
+        self.layout_phase()
         self.pairs_phase()
         self.progression_phase()
         self.failure_modes_phase()
@@ -315,6 +324,20 @@ class Verifier:
                              "`python3 -m assay_production.manifest_registry --write`. Until then the registry "
                              "cannot be trusted: a repeated id silently replaces the earlier entry.",
                    unprovable=[p.split("'")[1] for p in problems if "duplicate" in p and "'" in p])
+
+    # -- 0b. the folder itself -------------------------------------------------
+    def layout_phase(self) -> None:
+        problems = mr.corpus_layout_problems(self.root)
+        codes = [c for c, _ in problems]
+        self.check("specimens.layout",
+                   "specimens/: only plain files (no symbolic links, special files or bytecode caches)",
+                   not problems, kind="meta", problem="; ".join(t for _, t in problems[:10])
+                   + (" ..." if len(problems) > 10 else ""),
+                   reason=codes[0] if codes else "",
+                   next_step="Delete the link, cache or special file, or restore the real specimen with git. "
+                             "A link is refused even when it points at identical content: the verifier hashes "
+                             "and runs files, and a link lets the content change without the hash noticing.",
+                   unprovable=sorted({e for _, t in problems for e in entries_for_path(t.split(" ")[0])}))
 
     # -- 1. reconstruction pairs ---------------------------------------------
     def pairs_phase(self) -> None:
@@ -491,24 +514,26 @@ class Verifier:
     # -- sandbox bookkeeping --------------------------------------------------
     def sandbox_phase(self, corpus_before: Dict[str, str]) -> None:
         violations = [f"{n}: {v}" for n, r, _ in self.sandbox_runs for v in r.violations]
-        stray = [f"{n}: new item in the temp directory {s}" for n, r, _ in self.sandbox_runs for s in r.stray_files]
+        stray = [f"{n}: {s}" for n, r, _ in self.sandbox_runs for s in r.stray_files]
         flagged = sorted({e for _, r, es in self.sandbox_runs if r.violations or r.stray_files for e in es})
         self.check("sandbox.guard",
                    "sandbox: no specimen tried to write outside its scratch directory, start a program or use the network",
                    not violations and not stray, kind="meta",
-                   problem="; ".join(violations + stray) + (
-                       "" if not stray else " (a new item in the system temp directory may also come from an "
-                                           "unrelated program; run again to tell)"),
+                   problem="; ".join(violations + stray),
+                   reason="violation" if violations else "stray_write",
                    next_step="Read the specimen named above before running it again anywhere that matters. "
                              "A specimen that reaches outside its scratch folder cannot be verified safely, "
-                             "so the verdicts that depend on it are unprovable until it is removed or fixed.",
+                             "so the verdicts that depend on it are unprovable until it is removed or fixed. "
+                             "Only the specimen's own source folder and the sandbox's control directory are "
+                             "compared, never the shared /tmp, so other programs' temp files are not the cause.",
                    unprovable=flagged)
         after = mr.corpus_files(self.root)
+        changed = sorted(set(corpus_before) ^ set(after)
+                         | {k for k in corpus_before if k in after and corpus_before[k] != after[k]})
         self.check("sandbox.corpus_untouched", "sandbox: running the specimens changed no file under specimens/",
                    before_after_equal(corpus_before, after), kind="meta",
-                   problem="files under specimens/ differ before and after the run: "
-                           + ", ".join(sorted(set(corpus_before) ^ set(after)
-                                              | {k for k in corpus_before if k in after and corpus_before[k] != after[k]})),
+                   problem="files under specimens/ differ before and after the run: " + ", ".join(changed),
+                   reason="stray_write",
                    next_step="Restore the files with git and find out which specimen wrote to the corpus.")
 
     # -- 6. the answer key itself ---------------------------------------------
@@ -1008,6 +1033,8 @@ def render_report(report: Report, root: Path, *, show_pass: bool = True) -> Tupl
         for c in failures:
             lines.append("")
             lines.append(f"* {c.label}")
+            if c.reason:
+                lines.append(f"    Reason: {c.reason}")
             if c.problem:
                 lines.append(f"    What happened: {c.problem}")
             names = [f"{e} (verdict {verdicts.get(e, '?')})" for e in dict.fromkeys(c.unprovable)]
@@ -1027,25 +1054,107 @@ def run_all(root: Path, *, strict: bool = False) -> Report:
     return Verifier(root, strict=strict).all()
 
 
+SUMMARY_PREFIX = "ASSAY-SUMMARY: "
+SUMMARY_SCHEMA = "assay-summary/1"
+
+
+def summary_record(report: Report, status: str = "") -> dict:
+    """The machine-readable summary printed on one line (see README, 'The summary line')."""
+    counts = _count_levels(report.derived) if report.derived else {EXECUTION: 0, STATIC: 0, UNVALIDATED: 0}
+    total = [c for c in report.claims if not c.skipped]
+    failures = report.failures
+    return {
+        "schema": SUMMARY_SCHEMA,
+        "all_claims_hold": bool(report.claims) and not failures and not report.skips,
+        "status": status or ("MANIFEST_INCONSISTENT" if failures else "UNKNOWN"),
+        "claims": {"total": len(total), "passed": len(total) - len(failures), "failed": len(failures),
+                   "skipped": len(report.skips)},
+        "entries": {"total": len(report.derived), "counts": counts,
+                    "status": {sid: st["validation"]["level"] for sid, st in sorted(report.derived.items())}},
+        "failures": [{"claim": c.id, "reason": c.reason or "claim_failed", "detail": c.problem[:400]}
+                     for c in failures],
+    }
+
+
+def failure_line(report: Report) -> str:
+    """One stderr line saying why the key is not proven: which claim, and which reason."""
+    total = [c for c in report.claims if not c.skipped]
+    failures = report.failures
+    head = f"ASSAY: answer key NOT PROVEN ({len(total) - len(failures)}/{len(total)} claims hold)."
+    parts = []
+    for c in failures[:3]:
+        detail = " ".join((c.problem or c.label).split())
+        parts.append(f"claim {c.id} failed because {c.reason or 'claim_failed'}: {detail[:220]}")
+    more = f" (+{len(failures) - 3} more failing claim(s); see the report on stdout)" if len(failures) > 3 else ""
+    return head + " " + " | ".join(parts) + more
+
+
+def reexec_with_minimal_environment(root: Path, argv: Sequence[str]) -> None:
+    """Restart the verifier with a minimal environment, so no secret of the caller is in its /proc/<pid>/environ.
+
+    Only when this process is the real ``verify_manifest.py`` (never when
+    imported by a test). If the restart is impossible, the secrets are at
+    least removed from ``os.environ`` so nothing this process starts inherits them.
+    """
+    if os.environ.get("ASSAY_MINIMAL_ENV") == "1":
+        return
+    env = sandbox_module.minimal_parent_environment()
+    script = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+    if script is not None and script == (Path(root) / "verify_manifest.py").resolve():
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execve(sys.executable, [sys.executable, str(script), *argv], env)
+        except OSError:
+            pass
+    os.environ.clear()
+    os.environ.update(env)
+
+
 def main(root: Path, argv: Sequence[str]) -> int:
-    strict = "--strict" in argv or bool(__import__("os").environ.get("ASSAY_STRICT"))
+    strict = "--strict" in argv or bool(os.environ.get("ASSAY_STRICT"))
     if "--write" in argv:
         return write_all(root)
+    reexec_with_minimal_environment(root, argv)
+    sandbox_module.protect_current_process()
+    sandbox_module.install_signal_cleanup()
+    try:
+        return _verify(root, strict)
+    except Exception as exc:  # noqa: BLE001 - say why, then fail closed
+        import traceback
+        traceback.print_exc()
+        print(f"ASSAY: answer key NOT PROVEN: the verifier itself failed ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return 1
+    finally:
+        sandbox_module.cleanup_active()
+
+
+def _verify(root: Path, strict: bool) -> int:
     report = run_all(root, strict=strict)
     print("sandbox: " + describe_isolation())
     text, ok = render_report(report, root)
     print(text)
     verifier = ManifestVerifier(root)
+    status = ""
     if report.derived:
         result = verifier.result_from_statuses(report.derived)
         result = verifier.mark_validated(result, [sid for sid, st in report.derived.items()
                                                   if st["validation"]["level"] != UNVALIDATED])
+        status = result.status
         counts = _count_levels(report.derived)
         print(f"answer key status: {result.status} "
               f"({counts[EXECUTION]} verified by execution, {counts[STATIC]} by static check, "
               f"{counts[UNVALIDATED]} unvalidated, of {len(report.derived)} entries)")
+    if not ok:
+        status = "MANIFEST_INCONSISTENT"
+    print(SUMMARY_PREFIX + json.dumps(summary_record(report, status), sort_keys=True, separators=(",", ":")))
+    if not ok:
+        print(failure_line(report), file=sys.stderr)
     if strict and report.skips:
         print("--strict: claims that could not be run count as failures.")
+        print("ASSAY: --strict: " + str(len(report.skips)) + " claim(s) could not be run here (missing_dependency): "
+              + ", ".join(c.id for c in report.skips), file=sys.stderr)
         return 1
     return 0 if ok else 1
 
